@@ -1,0 +1,106 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-apk:
+    name: Android universal APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK and NDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-apk
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Generate Android project
+        run: pnpm tauri android init --ci
+
+      - name: Build universal release APK
+        run: pnpm tauri android build --apk --target aarch64 armv7 x86_64
+
+      - name: Sign and verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_apk="$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' ! -name '*debug*' | head -n 1)"
+          if [ -z "$source_apk" ]; then
+            echo "::error::No release APK was produced"
+            exit 1
+          fi
+
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/$BT/zipalign"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          KEYSTORE="$RUNNER_TEMP/hghub-release.p12"
+          ALIGNED="$RUNNER_TEMP/hghub-aligned.apk"
+          PASSWORD="$(openssl rand -hex 24)"
+
+          keytool -genkeypair \
+            -keystore "$KEYSTORE" \
+            -storetype PKCS12 \
+            -storepass "$PASSWORD" \
+            -keypass "$PASSWORD" \
+            -alias hghub \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=HGhub, OU=Personal, O=HGhub, L=Shanghai, ST=Shanghai, C=CN" \
+            -noprompt
+
+          "$ZIPALIGN" -f -p 4 "$source_apk" "$ALIGNED"
+          mkdir -p artifacts
+          OUT="artifacts/HGhub_1.2.1_android_universal.apk"
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias hghub \
+            --ks-pass "pass:$PASSWORD" \
+            --key-pass "pass:$PASSWORD" \
+            --out "$OUT" \
+            "$ALIGNED"
+          "$APKSIGNER" verify --verbose --print-certs "$OUT"
+          rm -f "$KEYSTORE" "$ALIGNED"
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: artifacts/*.apk
+          if-no-files-found: error
